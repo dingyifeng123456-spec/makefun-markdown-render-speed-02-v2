@@ -153,7 +153,10 @@ function stripIndent(line, cols) {
     else if (ch === '\t') {
       const w = 4 - (col % 4);
       if (col + w <= cols) { col += w; i++; }
-      else { return ' '.repeat(col + w - cols) + line.slice(i + 1); }
+      // A tab straddling the strip boundary is removed entirely
+      // (marked: a fenced-code content line '\tindented...' with a
+      // 2-column fence indent becomes 'indented...', not '  indented...').
+      else { return line.slice(i + 1); }
     } else break;
   }
   return line.slice(i);
