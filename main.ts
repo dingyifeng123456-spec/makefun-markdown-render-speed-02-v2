@@ -558,9 +558,11 @@ function labelHasBadCodeSpan(s) {
 }
 
 // Whether `s` holds a backtick run of length >= 2 with no matching run of
-// the same length later in `s` (an unclosed `` `` `` opener). A link whose
-// label holds one still forms, but marked then suppresses emphasis later
-// in the same paragraph.
+// the same length later in `s` (an unclosed `` `` `` opener). Runs pair in
+// order: once a run finds its closer, scanning resumes after the closer,
+// so a closer is never re-examined as a fresh opener. A link whose label
+// holds one still forms, but marked then suppresses emphasis later in the
+// same paragraph (up to the next backtick).
 function labelHasUnclosedDoubleTick(s) {
   const n = s.length;
   let i = 0;
@@ -570,16 +572,18 @@ function labelHasUnclosedDoubleTick(s) {
     while (j < n && s[j] === '`') j++;
     const run = j - i;
     if (run >= 2) {
-      let m = j, found = false;
+      let m = j, found = -1;
       while (m < n) {
         if (s[m] === '`') {
           let e = m;
           while (e < n && s[e] === '`') e++;
-          if (e - m === run) { found = true; break; }
+          if (e - m === run) { found = e; break; }
           m = e;
         } else m++;
       }
-      if (!found) return true;
+      if (found === -1) return true;
+      i = found;
+      continue;
     }
     i = j;
   }
@@ -724,16 +728,16 @@ function tryLink(s, i, refs, isImage) {
   if (title != null) out += ' title="' + escAttr(unescape(title)) + '"';
   linkCount++;
   // A link whose label holds an unclosed double backtick run suppresses
-  // `_`/`__` emphasis after it up to the next backtick in the paragraph
-  // (the lone backtick in the label pairs with that backtick as a code
-  // span, swallowing the emphasis between them). Past that backtick,
-  // emphasis is normal again.
-  if (labelHasUnclosedDoubleTick(label)) {
-    const bt = s.indexOf('`', j);
-    if (bt !== -1) {
-      suppressEmphasis = true;
-      suppressUntil = bt;
-    }
+  // `*`/`_` emphasis after it, but only when a backtick follows the link
+  // in the paragraph, and only up to the next double backtick run (or, if
+  // there is none, the next single backtick): a complete `` `...` `` code
+  // span in between does not end the suppression, but emphasis past the
+  // next double backtick run is normal again.
+  if (labelHasUnclosedDoubleTick(label) && s.indexOf('`', j) !== -1) {
+    const dbl = s.indexOf('``', j);
+    const sng = s.indexOf('`', j);
+    suppressEmphasis = true;
+    suppressUntil = dbl !== -1 ? dbl : sng;
   }
   return { html: out + '>' + inner + '</a>', end: j };
 }
@@ -977,10 +981,10 @@ let labelDepth = 0;
 let noEmphasis = false;
 
 // Set when a link forms whose label holds an unclosed backtick run of
-// length >= 2 (e.g. `` ``small` ``): marked then leaves `_`/`__` emphasis
-// between the link and the next backtick literal. Cleared at the start of
-// each top-level parseInline call, and only applies before `suppressUntil`
-// (the next backtick), so it never leaks past it.
+// length >= 2 (e.g. `` ``small` ``): marked then leaves `*`/`_` emphasis
+// after it literal, up to the next double backtick run (or, if there is
+// none, the next single backtick). Cleared at the start of each top-level
+// parseInline call, and only applies before `suppressUntil`.
 let suppressEmphasis = false;
 let suppressUntil = -1;
 let parseInlineDepth = 0;
@@ -1089,9 +1093,9 @@ function parseInline(s, refs, allowLinks) {
       // A run of three or more tildes is literal text, never a delimiter.
       // So is any emphasis run while a failed link label is being rendered.
       // The post-link suppression (unclosed double backtick in the label)
-      // only ever silences `_`/`__` runs in marked, never `*`/`**`, and
-      // only on the link's own line.
-      if (noEmphasis || (suppressEmphasis && ch === '_' && i < suppressUntil) || (ch === '~' && run > 2)) { text += s.slice(i, k); i = k; continue; }
+      // silences `*`/`_` runs in marked up to the next backtick, but only
+      // in the top-level paragraph text, never inside a link label.
+      if (noEmphasis || (suppressEmphasis && ch !== '~' && parseInlineDepth === 1 && i < suppressUntil) || (ch === '~' && run > 2)) { text += s.slice(i, k); i = k; continue; }
       const [left, right] = flank(s, i, run);
       let canOpen, canClose;
       if (ch === '_') {
