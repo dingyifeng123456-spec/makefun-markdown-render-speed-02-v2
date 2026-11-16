@@ -806,37 +806,44 @@ function tryGfmAutolink(s, i, prev) {
     if (href === null) return null;
     return { html: '<a href="' + escAttr(href) + '">' + escText(url) + '</a>', end: m[1] };
   }
-  // scheme://...
-  const scheme = /^([A-Za-z][A-Za-z0-9+.-]{1,31}):\/\//.exec(s.slice(i, i + 40));
-  if (scheme) {
-    m = matchGfmUrl(s, i, true);
-    if (m === null) return null;
-    const url = m[0];
-    const href = cleanUrl(url);
-    if (href === null) return null;
-    return { html: '<a href="' + escAttr(href) + '">' + escText(url) + '</a>', end: m[1] };
-  }
-  // Bare scheme: mailto:, xmpp:, ... (no '://'). The part after ':' is
-  // an email-like address with an optional single path segment.
-  const bare = /^([A-Za-z][A-Za-z0-9+.-]{1,31}):/.exec(s.slice(i, i + 40));
-  if (bare) {
-    // The body after the scheme colon must be non-empty: 'README.md:'
-    // is a filename followed by a colon, not a URL.
-    const afterColon = i + bare[0].length;
-    if (afterColon >= n || isSpaceU(s[afterColon])) return null;
-    m = matchGfmUrl(s, i, false);
-    if (m === null) return null;
-    // The matched URL must still carry the scheme colon: if trailing
-    // punctuation stripping ate it (e.g. 'renderer.code:.'), the text
-    // was not a scheme URL at all, just a word followed by a colon.
-    if (!m[0].startsWith(bare[0])) return null;
-    const url = m[0];
-    const href = cleanUrl(url);
-    if (href === null) return null;
-    return { html: '<a href="' + escAttr(href) + '">' + escText(url) + '</a>', end: m[1] };
+  // Cheap pre-checks: a scheme needs ':' soon, an email needs '@' soon.
+  // Most words have neither, so skip the regexes (and their slices) there.
+  const colon = s.indexOf(':', i);
+  if (colon !== -1 && colon - i <= 32) {
+    // scheme://...
+    const scheme = /^([A-Za-z][A-Za-z0-9+.-]{1,31}):\/\//.exec(s.slice(i, i + 40));
+    if (scheme) {
+      m = matchGfmUrl(s, i, true);
+      if (m === null) return null;
+      const url = m[0];
+      const href = cleanUrl(url);
+      if (href === null) return null;
+      return { html: '<a href="' + escAttr(href) + '">' + escText(url) + '</a>', end: m[1] };
+    }
+    // Bare scheme: mailto:, xmpp:, ... (no '://'). The part after ':' is
+    // an email-like address with an optional single path segment.
+    const bare = /^([A-Za-z][A-Za-z0-9+.-]{1,31}):/.exec(s.slice(i, i + 40));
+    if (bare) {
+      // The body after the scheme colon must be non-empty: 'README.md:'
+      // is a filename followed by a colon, not a URL.
+      const afterColon = i + bare[0].length;
+      if (afterColon >= n || isSpaceU(s[afterColon])) return null;
+      m = matchGfmUrl(s, i, false);
+      if (m === null) return null;
+      // The matched URL must still carry the scheme colon: if trailing
+      // punctuation stripping ate it (e.g. 'renderer.code:.'), the text
+      // was not a scheme URL at all, just a word followed by a colon.
+      if (!m[0].startsWith(bare[0])) return null;
+      const url = m[0];
+      const href = cleanUrl(url);
+      if (href === null) return null;
+      return { html: '<a href="' + escAttr(href) + '">' + escText(url) + '</a>', end: m[1] };
+    }
   }
   // email user@domain.tld
-  m = /^([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+)@([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)/.exec(s.slice(i));
+  const at = s.indexOf('@', i);
+  if (at === -1 || at - i > 64) return null;
+  m = /^([A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+)@([A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+)/.exec(s.slice(i, i + 320));
   if (m) {
     const addr = m[0];
     // A trailing '-' or '_' after the address invalidates the email,
@@ -1195,6 +1202,31 @@ function hasStrongOpenCloser(list) {
   return false;
 }
 
+// Range versions of the span scans above: iterate `nodes[lo..hi)` directly
+// instead of allocating a slice (hot in the delimiter search loop).
+function countBothEmRange(nodes, lo, hi) {
+  let n = 0;
+  for (let i = lo; i < hi; i++) {
+    const nd = nodes[i];
+    if (nd.t === 'e') {
+      if (nd.bo) n++;
+      n += countBothEm(nd.kids);
+    }
+  }
+  return n;
+}
+
+function hasStrongOpenCloserRange(nodes, lo, hi) {
+  for (let i = lo; i < hi; i++) {
+    const nd = nodes[i];
+    if (nd.t === 'e') {
+      if (nd.strong && nd.bc) return true;
+      if (hasStrongOpenCloser(nd.kids)) return true;
+    }
+  }
+  return false;
+}
+
 // Process emphasis / strikethrough delimiters in `nodes` (in place).
 // Marked's delimiter matching, derived from its behaviour on the practice
 // documents and probe cases (it deviates from the CommonMark appendix
@@ -1278,9 +1310,12 @@ function processDelims(nodes) {
       const closerBoth = closer.o && closer.c;
       if ((candBoth || closerBoth) && (cand.n + closer.n) % 3 === 0 && !(cand.n % 3 === 0 && closer.n % 3 === 0)) continue;
       let u = cand.n >= 2 && closer.n >= 2 ? 2 : 1;
+      // The opener's index in `nodes`, computed once and reused by the
+      // span checks below (indexOf is linear).
+      let oIdx = -1;
       if (cand.n > 2) {
-        const oIdx = nodes.indexOf(cand);
-        const bothEm = countBothEm(nodes.slice(oIdx + 1, idx));
+        oIdx = nodes.indexOf(cand);
+        const bothEm = countBothEmRange(nodes, oIdx + 1, idx);
         if (bothEm > 0) {
           const effO = cand.n - 2 * bothEm;
           if (effO > 2) continue; // this opener cannot match; try an earlier one
@@ -1292,14 +1327,15 @@ function processDelims(nodes) {
       // `**` opener of the same char waits below this opener in the
       // stack): skip this opener and try an earlier one. Without that
       // enclosing `**` opener the em does form (e.g. `*foo**bar**baz*`).
+      // Check the cheap stack condition first; only then scan the span.
       if (u === 1) {
-        const oIdx = nodes.indexOf(cand);
-        if (hasStrongOpenCloser(nodes.slice(oIdx + 1, idx))) {
-          let belowStrong = false;
-          for (let t = s - 1; t >= 0; t--) {
-            if (stack[t].ch === closer.ch && stack[t].o && stack[t].n >= 2) { belowStrong = true; break; }
-          }
-          if (belowStrong) continue;
+        let belowStrong = false;
+        for (let t = s - 1; t >= 0; t--) {
+          if (stack[t].ch === closer.ch && stack[t].o && stack[t].n >= 2) { belowStrong = true; break; }
+        }
+        if (belowStrong) {
+          if (oIdx === -1) oIdx = nodes.indexOf(cand);
+          if (hasStrongOpenCloserRange(nodes, oIdx + 1, idx)) continue;
         }
       }
       found = s; use = u; break;
@@ -1872,6 +1908,35 @@ function fenceContentLines(lines) {
   return ch !== null ? count : -1;
 }
 
+// Incremental fence tracker: feed each new content line once; `inFence`
+// tells whether the content so far ends inside a fenced code block.
+// Equivalent to endsInFence(lines) but O(1) per line instead of O(n),
+// because a fence is decided by the start of each line and appending a
+// lazy continuation to an existing line never changes that line's start.
+function makeFenceTracker() {
+  let ch = null, len = 0;
+  return {
+    get inFence() { return ch !== null; },
+    feed(line) {
+      if (ch !== null) {
+        const [c2, ix2] = indentOf(line);
+        if (c2 <= 3) {
+          let k = ix2, run = 0;
+          while (k < line.length && line[k] === ch) { run++; k++; }
+          if (run >= len) {
+            let m = k;
+            while (m < line.length && (line[m] === ' ' || line[m] === '\t')) m++;
+            if (m === line.length) { ch = null; len = 0; }
+          }
+        }
+        return;
+      }
+      const f = matchFence(line);
+      if (f) { ch = f[0]; len = f[1]; }
+    }
+  };
+}
+
 function endsInFence(lines) {
   let ch = null, len = 0;
   for (const l of lines) {
@@ -1911,6 +1976,7 @@ function isParaLine(line, next) {
 // Blockquote starting at lines[i]. Returns the next line index.
 function parseBlockquote(lines, i, end, refs, blocks) {
   const qlines = [];
+  const fence = makeFenceTracker();
   let j = i;
   let inPara = false;
   while (j < end) {
@@ -1923,7 +1989,8 @@ function parseBlockquote(lines, i, end, refs, blocks) {
       const cols = c + (after === ' ' || after === '\t' ? 2 : 1);
       const inner = stripContainer(l, cols);
       qlines.push(inner);
-      inPara = isParaLine(inner, j + 1 < end ? lines[j + 1] : undefined) && !endsInFence(qlines);
+      fence.feed(inner);
+      inPara = isParaLine(inner, j + 1 < end ? lines[j + 1] : undefined) && !fence.inFence;
       j++;
       continue;
     }
@@ -1940,7 +2007,7 @@ function parseBlockquote(lines, i, end, refs, blocks) {
       // kept as its own line, indented by four spaces so it stays
       // paragraph text.
       const stripped = stripLazyIndent(l);
-      if (matchSetext(stripped)) qlines.push('    ' + stripped);
+      if (matchSetext(stripped)) { qlines.push('    ' + stripped); fence.feed('    ' + stripped); }
       else qlines[qlines.length - 1] += '\n' + stripped;
       j++;
       continue;
@@ -1980,10 +2047,12 @@ function parseList(lines, i, end, refs, blocks) {
     // gives an empty fence and a separate paragraph). Only once a content
     // line at/above the indent has established the fence do lower lines
     // get swallowed.
-    if (cur && endsInFence(cur.lines)) {
+    if (cur && cur.fence.inFence) {
       const [ccol] = indentOf(line);
       if (ccol >= cur.contentIndent || fenceContentLines(cur.lines) > 0) {
-        cur.lines.push(stripContainerIndent(line, cur.contentIndent));
+        const pushed = stripContainerIndent(line, cur.contentIndent);
+        cur.lines.push(pushed);
+        cur.fence.feed(pushed);
         j++;
         continue;
       }
@@ -2003,7 +2072,7 @@ function parseList(lines, i, end, refs, blocks) {
       if (curEmpty && !sameItem) break;
       if (sameItem) loose = true;
       if (sameItem || contIndent) {
-        if (cur) cur.lines.push('');
+        if (cur) { cur.lines.push(''); cur.fence.feed(''); }
         j++;
         continue;
       }
@@ -2015,14 +2084,17 @@ function parseList(lines, i, end, refs, blocks) {
       // A thematic break ends the list even when it looks like an item.
       if (matchHr(line)) break;
       flushItem();
-      cur = { lines: [ls.content], contentIndent: ls.contentIndent, bullet: ls.bullet, delim: ls.delim, start: ls.start };
+      cur = { lines: [ls.content], contentIndent: ls.contentIndent, bullet: ls.bullet, delim: ls.delim, start: ls.start, fence: makeFenceTracker() };
+      cur.fence.feed(ls.content);
       j++;
       continue;
     }
     if (!cur) break;
     const [col] = indentOf(line);
     if (col >= cur.contentIndent) {
-      cur.lines.push(stripContainer(line, cur.contentIndent));
+      const pushed = stripContainer(line, cur.contentIndent);
+      cur.lines.push(pushed);
+      cur.fence.feed(pushed);
       j++;
       continue;
     }
@@ -2031,14 +2103,14 @@ function parseList(lines, i, end, refs, blocks) {
     // Lazy continuation of the item's paragraph?
     const inner = cur.lines;
     const lastLine = inner.length ? inner[inner.length - 1] : null;
-    const inPara = lastLine !== null && isParaLine(lastLine, j + 1 < end ? lines[j + 1] : undefined) && !endsInFence(inner);
+    const inPara = lastLine !== null && isParaLine(lastLine, j + 1 < end ? lines[j + 1] : undefined) && !cur.fence.inFence;
     if (inPara && !interruptsParagraph(line, j + 1 < end ? lines[j + 1] : undefined, true)) {
       // Lazy continuation of the item's paragraph: its leading
       // whitespace is kept, except that a run of 4+ columns loses its
       // first 4 columns (the indented-code indent); a tab in the run
       // is consumed whole when it lands on that boundary.
       const stripped = stripLazyIndent(line);
-      if (matchSetext(stripped)) inner.push('    ' + stripped);
+      if (matchSetext(stripped)) { inner.push('    ' + stripped); cur.fence.feed('    ' + stripped); }
       else inner[inner.length - 1] += '\n' + stripped;
       j++;
       continue;
