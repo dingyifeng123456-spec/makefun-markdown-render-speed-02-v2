@@ -1806,8 +1806,8 @@ export function parse(md) {
 }
 
 // ---------- driver ----------
-const inputPath = process.argv[2] || '/input/cases.json';
-const outputPath = process.argv[3] || '/output/html.json';
+const inputPath = process.argv[2] || (process.env.MAKEFUN_INPUT_DIR ? process.env.MAKEFUN_INPUT_DIR + '/cases.json' : '/input/cases.json');
+const outputPath = process.argv[3] || (process.env.MAKEFUN_OUTPUT_DIR ? process.env.MAKEFUN_OUTPUT_DIR + '/html.json' : '/output/html.json');
 const cases = JSON.parse(readFileSync(inputPath, 'utf8'));
 const html = cases.map((c) => parse(c.markdown));
 mkdirSync(outputPath.slice(0, outputPath.lastIndexOf('/')), { recursive: true });
