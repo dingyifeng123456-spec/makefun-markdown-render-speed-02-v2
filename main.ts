@@ -724,10 +724,17 @@ function tryLink(s, i, refs, isImage) {
   if (title != null) out += ' title="' + escAttr(unescape(title)) + '"';
   linkCount++;
   // A link whose label holds an unclosed double backtick run suppresses
-  // emphasis later in the paragraph, but only when a backtick (a code
-  // span) follows the link in the same paragraph: without one, the
-  // emphasis still forms.
-  if (labelHasUnclosedDoubleTick(label) && s.slice(j).indexOf('`') !== -1) suppressEmphasis = true;
+  // `_`/`__` emphasis after it up to the next backtick in the paragraph
+  // (the lone backtick in the label pairs with that backtick as a code
+  // span, swallowing the emphasis between them). Past that backtick,
+  // emphasis is normal again.
+  if (labelHasUnclosedDoubleTick(label)) {
+    const bt = s.indexOf('`', j);
+    if (bt !== -1) {
+      suppressEmphasis = true;
+      suppressUntil = bt;
+    }
+  }
   return { html: out + '>' + inner + '</a>', end: j };
 }
 
@@ -971,9 +978,11 @@ let noEmphasis = false;
 
 // Set when a link forms whose label holds an unclosed backtick run of
 // length >= 2 (e.g. `` ``small` ``): marked then leaves `_`/`__` emphasis
-// later in the same paragraph literal. Cleared at the start of each
-// top-level parseInline call, so it never leaks into the next block.
+// between the link and the next backtick literal. Cleared at the start of
+// each top-level parseInline call, and only applies before `suppressUntil`
+// (the next backtick), so it never leaks past it.
 let suppressEmphasis = false;
+let suppressUntil = -1;
 let parseInlineDepth = 0;
 
 // Whether inline parsing is inside an unclosed <a> tag. marked's inline
@@ -999,7 +1008,7 @@ function trackLinkTag(tag) {
 // The main inline parser. `allowLinks` false while parsing link text / alt
 // text (links do not nest; images still may appear in link text).
 function parseInline(s, refs, allowLinks) {
-  if (parseInlineDepth === 0) suppressEmphasis = false;
+  if (parseInlineDepth === 0) { suppressEmphasis = false; suppressUntil = -1; }
   parseInlineDepth++;
   try {
   const n = s.length;
@@ -1080,8 +1089,9 @@ function parseInline(s, refs, allowLinks) {
       // A run of three or more tildes is literal text, never a delimiter.
       // So is any emphasis run while a failed link label is being rendered.
       // The post-link suppression (unclosed double backtick in the label)
-      // only ever silences `_`/`__` runs in marked, never `*`/`**`.
-      if (noEmphasis || (suppressEmphasis && ch === '_') || (ch === '~' && run > 2)) { text += s.slice(i, k); i = k; continue; }
+      // only ever silences `_`/`__` runs in marked, never `*`/`**`, and
+      // only on the link's own line.
+      if (noEmphasis || (suppressEmphasis && ch === '_' && i < suppressUntil) || (ch === '~' && run > 2)) { text += s.slice(i, k); i = k; continue; }
       const [left, right] = flank(s, i, run);
       let canOpen, canClose;
       if (ch === '_') {
