@@ -1379,10 +1379,13 @@ function processDelims(nodes) {
       if (ci !== -1) stack.splice(ci, 1);
     }
     // OB is set to the delimiter below the opener only when the closer can
-    // open and the opener cannot close; a fully consumed closer that cannot
-    // open clears it; otherwise it is left alone. Record whether the match
-    // that set it was a `<strong>`, for the OB exception in the search.
-    if (closer.o && !opener.c) { OB[closer.ch] = belowOpener; OBStrong[closer.ch] = useO === 2; }
+    // open and the opener cannot close, and the closer was fully consumed:
+    // a leftover closer still has to match openers below the floor (e.g.
+    // `***` closing a strong leaves one `*` for an outer `<em>`). A fully
+    // consumed closer that cannot open clears it; otherwise it is left
+    // alone. Record whether the match that set it was a `<strong>`, for
+    // the OB exception in the search.
+    if (closer.o && !opener.c && closerLeft === 0) { OB[closer.ch] = belowOpener; OBStrong[closer.ch] = useO === 2; }
     else if (!closer.o && closerLeft === 0) { OB[closer.ch] = null; OBStrong[closer.ch] = false; }
     idx = emIdx + 1;
   }
