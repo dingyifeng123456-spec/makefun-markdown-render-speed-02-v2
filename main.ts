@@ -162,6 +162,23 @@ function stripIndent(line, cols) {
   return line.slice(i);
 }
 
+// Strip the first 4 columns of a lazy continuation line's leading
+// whitespace (the indented-code indent), if the run is at least 4
+// columns; otherwise keep the line as-is. A space is 1 column; a tab
+// expands to the next tab stop and is consumed whole when it lands on
+// the boundary (a tab from a column below 4 always lands on 4).
+// Spaces below 4 columns are preserved, and anything after the 4th
+// column (including a further tab, kept literally) is kept as-is.
+function stripLazyIndent(line) {
+  let col = 0, i = 0;
+  while (i < line.length && (line[i] === ' ' || line[i] === '\t')) {
+    if (line[i] === ' ') { col++; i++; }
+    else { col = 4 * (Math.floor(col / 4) + 1); i++; }
+    if (col >= 4) return line.slice(i);
+  }
+  return line;
+}
+
 // Strip up to `cols` columns of leading whitespace (a container's
 // content indent), expanding a tab that straddles the boundary to spaces
 // based on its original column. Unlike stripContainer, never eats a
@@ -461,9 +478,11 @@ function findLinkLabelEnd(s, i) {
       let k = j;
       while (k < n && s[k] === '`') k++;
       const run = k - j;
-      // Find a matching run of the same length.
+      // Find a matching run of the same length on this same line only.
+      // A closing run on a later line must not swallow the label's own
+      // `]`: the code span is unclosed here and the backticks are literal.
       let m = k, found = -1;
-      while (m < n) {
+      while (m < n && s[m] !== '\n') {
         if (s[m] === '`') {
           let e = m;
           while (e < n && s[e] === '`') e++;
@@ -491,6 +510,44 @@ function hasUnescapedBracket(s) {
   for (let i = 0; i < s.length; i++) {
     if (s[i] === '\\') { i++; continue; }
     if (s[i] === '[' || s[i] === ']') return true;
+  }
+  return false;
+}
+
+// Whether a link label's backticks break link formation. Marked's label
+// matcher only understands code spans as `+[^`]*`+ groups; a backtick that
+// cannot be part of such a group (a lone backtick, or one left over after
+// a group) makes the whole label unmatchable. And a multi-backtick code
+// span whose content itself holds a backtick (`` a ` b ``) breaks the
+// label too, unless the label ends right after that span.
+function labelHasBadCodeSpan(s) {
+  if (!/^(?:`+[^`]*`+|\\.|[^`])*$/.test(s)) return true;
+  const n = s.length;
+  let i = 0;
+  while (i < n) {
+    const ch = s[i];
+    if (ch === '\\' && i + 1 < n) { i += 2; continue; }
+    if (ch !== '`') { i++; continue; }
+    let j = i;
+    while (j < n && s[j] === '`') j++;
+    const run = j - i;
+    if (run >= 2) {
+      let m = j, found = -1;
+      while (m < n) {
+        if (s[m] === '`') {
+          let e = m;
+          while (e < n && s[e] === '`') e++;
+          if (e - m === run) { found = e; break; }
+          m = e;
+        } else m++;
+      }
+      if (found !== -1) {
+        if (s.slice(j, m).includes('`') && found < n) return true;
+        i = found;
+        continue;
+      }
+    }
+    i = j;
   }
   return false;
 }
@@ -541,6 +598,20 @@ function tryLink(s, i, refs, isImage) {
   const label = s.slice(start + 1, labelEnd - 1);
   // A link label containing an incomplete tag is not a link.
   if (!isImage && hasBrokenTag(label)) return null;
+  // A link label whose backticks cannot form proper code spans is not a
+  // link. The label is literal text, but its code spans (and other inline
+  // markup) are still rendered, while its emphasis is not: the failed
+  // link attempt already consumed those delimiters.
+  if (labelHasBadCodeSpan(label)) {
+    noEmphasis = true;
+    let inner;
+    try {
+      inner = parseInline(label, refs, true);
+    } finally {
+      noEmphasis = false;
+    }
+    return { html: (isImage ? '![' : '[') + inner + ']', end: labelEnd };
+  }
   let j = labelEnd;
   let dest = null, title = null;
   let ok = false;
@@ -705,6 +776,10 @@ function tryGfmAutolink(s, i, prev) {
     if (afterColon >= n || isSpaceU(s[afterColon])) return null;
     m = matchGfmUrl(s, i, false);
     if (m === null) return null;
+    // The matched URL must still carry the scheme colon: if trailing
+    // punctuation stripping ate it (e.g. 'renderer.code:.'), the text
+    // was not a scheme URL at all, just a word followed by a colon.
+    if (!m[0].startsWith(bare[0])) return null;
     const url = m[0];
     const href = cleanUrl(url);
     if (href === null) return null;
@@ -770,17 +845,39 @@ function matchGfmUrl(s, i, multiSlash) {
       if (secondSlash !== -1) url = url.slice(0, secondSlash);
     }
   }
+  // Truncate at the first '(' that has no matching ')' after it: an
+  // unmatched '(' cannot be part of the URL.
+  {
+    let depth = 0, firstUnmatched = -1;
+    for (let k = 0; k < url.length; k++) {
+      if (url[k] === '(') {
+        if (depth === 0) firstUnmatched = k;
+        depth++;
+      } else if (url[k] === ')') {
+        if (depth > 0) {
+          depth--;
+          if (depth === 0) firstUnmatched = -1;
+        }
+      }
+    }
+    if (depth > 0 && firstUnmatched !== -1) url = url.slice(0, firstUnmatched);
+  }
   // Strip trailing punctuation, honouring balanced parens and entities.
   for (;;) {
     if (url.length === 0) return null;
     const last = url[url.length - 1];
     if (last === ')' ) {
-      let open = 0, close = 0;
+      // Strip a trailing ')' only when it has no matching '(' before it:
+      // a ')' that closes an earlier '(' is part of the URL.
+      let depth = 0, matched = false;
       for (let k = 0; k < url.length; k++) {
-        if (url[k] === '(') open++;
-        else if (url[k] === ')') close++;
+        if (url[k] === '(') depth++;
+        else if (url[k] === ')') {
+          if (k === url.length - 1) matched = depth > 0;
+          if (depth > 0) depth--;
+        }
       }
-      if (close > open) { url = url.slice(0, -1); continue; }
+      if (!matched) { url = url.slice(0, -1); continue; }
       break;
     }
     if (last === ';') {
@@ -828,13 +925,20 @@ let linkCount = 0;
 // not formed (they stay plain text); angle-bracket autolinks still are.
 let labelDepth = 0;
 
+// When true, `*`/`_`/`~` runs are literal text, never emphasis delimiters.
+// Used to render a link label that cannot form a link (its emphasis was
+// already consumed by the failed link attempt).
+let noEmphasis = false;
+
 // Whether inline parsing is inside an unclosed <a> tag. marked's inline
 // lexer keeps this state across blocks: an unclosed <a> in one paragraph
 // suppresses GFM autolinks (www, scheme, email) in later paragraphs until
 // a </a> is seen. Explicit links and <> autolinks are not affected.
 let inLink = false;
 
-// Update inLink for a raw HTML tag `tag` (the full tag text).
+// Update inLink for a raw HTML tag `tag` (the full tag text). Any opening
+// <a> tag sets it, even a self-closing <a/> (in HTML that slash is ignored
+// for non-void elements, so it still opens the anchor); only </a> clears it.
 function trackLinkTag(tag) {
   const lower = tag.toLowerCase();
   if (lower.startsWith('</a') && (lower[3] === ' ' || lower[3] === '\t' || lower[3] === '\n' || lower[3] === '>')) {
@@ -842,7 +946,7 @@ function trackLinkTag(tag) {
     return;
   }
   if (lower.startsWith('<a') && (lower[2] === ' ' || lower[2] === '\t' || lower[2] === '\n' || lower[2] === '>' || lower[2] === '/')) {
-    if (!tag.endsWith('/>')) inLink = true;
+    inLink = true;
   }
 }
 
@@ -925,7 +1029,8 @@ function parseInline(s, refs, allowLinks) {
       while (k < n && s[k] === ch) k++;
       const run = k - i;
       // A run of three or more tildes is literal text, never a delimiter.
-      if (ch === '~' && run > 2) { text += s.slice(i, k); i = k; continue; }
+      // So is any emphasis run while a failed link label is being rendered.
+      if (noEmphasis || (ch === '~' && run > 2)) { text += s.slice(i, k); i = k; continue; }
       const [left, right] = flank(s, i, run);
       let canOpen, canClose;
       if (ch === '_') {
@@ -981,57 +1086,237 @@ function parseInline(s, refs, allowLinks) {
   return renderNodes(nodes);
 }
 
+// Count emphasis nodes in `list` (recursively) whose opener could both
+// open and close. Used for the effective-length rule.
+function countBothEm(list) {
+  let n = 0;
+  for (const nd of list) {
+    if (nd.t === 'e') {
+      if (nd.bo) n++;
+      n += countBothEm(nd.kids);
+    }
+  }
+  return n;
+}
+
+// Whether `list` holds (recursively) a plain `<em>` (use 1), as opposed to
+// a `<strong>`. Used for leftover-delimiter placement.
+function hasPlainEm(list) {
+  for (const nd of list) {
+    if (nd.t === 'e') {
+      if (!nd.strong) return true;
+      if (hasPlainEm(nd.kids)) return true;
+    }
+  }
+  return false;
+}
+
+// Whether `list` holds (recursively) a `<strong>` whose closing delimiter
+// could also open (a "both" closer, e.g. `**` between two word characters).
+// A potential `<em>` spanning such a strong does not form in marked: the
+// strong's closer, being able to open, sets the openers-bottom floor, and
+// the em that would swallow it stays literal. A strong whose closer could
+// only close does not block an outer `<em>` (e.g. `*a **b** c*`).
+function hasStrongOpenCloser(list) {
+  for (const nd of list) {
+    if (nd.t === 'e') {
+      if (nd.strong && nd.bc) return true;
+      if (hasStrongOpenCloser(nd.kids)) return true;
+    }
+  }
+  return false;
+}
+
 // Process emphasis / strikethrough delimiters in `nodes` (in place).
+// Marked's delimiter matching, derived from its behaviour on the practice
+// documents and probe cases (it deviates from the CommonMark appendix
+// algorithm in a few places):
+//  - openersBottom (OB): per delimiter char, a delimiter node below which
+//    no opener may be used. On a match, OB is set to the delimiter below
+//    the matched opener only when the closer can also open and the opener
+//    cannot close; it is cleared when the closer was fully consumed and
+//    cannot open; otherwise it is left alone. On a failure, OB is cleared
+//    when the search examined at least one opener (all blocked by the rule
+//    of 3); when the search hit the floor without examining any opener, OB
+//    becomes the delimiter below the closer when the closer can open, else
+//    it is cleared. Exception: a closer may still match the OB node itself
+//    when it is the bottommost opener of that char (no same-char opener
+//    below it in the stack) and either (a) it is a single delimiter and the
+//    match that set the OB was an `<em>`, or (b) the match that set the OB
+//    was a `<strong>` and this match would itself use 2, or (c) the closer
+//    run is longer than the opener run (so the match leaves a leftover
+//    closer). An outer `<em>` containing a `<strong>` stays literal.
+//  - Rule of 3 (standard): when either delimiter can both open and close
+//    and the lengths sum to a multiple of 3, they cannot match, unless
+//    both lengths are themselves multiples of 3.
+//  - When the span contains an emphasis whose opener could both open and
+//    close, the outer opener's effective length is reduced by 2 per such
+//    inner emphasis: if that leaves more than 2, the outer pair does not
+//    match at all (the search moves on to an earlier opener); otherwise
+//    the number used is the reduced length (at least 1, at most the
+//    closer's length), falling back to the standard rule when the reduced
+//    length is 0 or less.
+//  - An opener's leftover delimiters become text at the start of the new
+//    emphasis when the span holds a plain `<em>`, and stay a delimiter
+//    before it otherwise. A closer's leftover delimiters are reprocessed
+//    as a delimiter right after the new emphasis; if that leftover then
+//    fails to match anything, it becomes text at the end of the emphasis
+//    when the match was a strong whose opener was fully consumed and whose
+//    span held a plain `<em>`, and stays literal text after it otherwise.
 function processDelims(nodes) {
+  const OB = { '*': null, '_': null, '~': null };
+  // Whether the match that set each OB was a `<strong>` (use 2).
+  const OBStrong = { '*': false, '_': false, '~': false };
   const stack = [];
   let idx = 0;
   while (idx < nodes.length) {
     const node = nodes[idx];
     if (node.t !== 'd') { idx++; continue; }
     const closer = node;
-    if (!closer.c || closer.n === 0) {
-      if (closer.o && closer.n > 0) stack.push(closer);
-      idx++; continue;
-    }
+    if (!stack.includes(closer)) stack.push(closer);
+    if (!closer.c || closer.n === 0) { idx++; continue; }
+    // --- search for an opener (topmost first) ---
     let found = -1;
-    for (let s = stack.length - 1; s >= 0; s--) {
-      const opener = stack[s];
-      if (opener.ch !== closer.ch || !opener.o || opener.n === 0) continue;
-      // Rule of 3: when either delimiter can both open and close and the
-      // lengths sum to a multiple of 3, they cannot match, unless both
-      // lengths are themselves multiples of 3.
-      const openerBoth = opener.o && opener.c;
+    let examined = false;
+    let use = 1;
+    for (let s = stack.length - 2; s >= 0; s--) {
+      const cand = stack[s];
+      if (cand.ch !== closer.ch) continue;
+      if (cand === OB[closer.ch]) {
+        // The OB floor: normally the search stops here. But a closer may
+        // still match the OB node itself when it is the bottommost opener
+        // of that char and either (a) it is a single delimiter and the
+        // match that set the OB was an `<em>` (not a `<strong>`), or
+        // (b) the match that set the OB was a `<strong>` and this match
+        // would itself use 2 (a `<strong>` containing a `<strong>`).
+        // An outer `<em>` containing a `<strong>` stays literal.
+        let bottommost = true;
+        for (let t = s - 1; t >= 0; t--) {
+          if (stack[t].ch === closer.ch && stack[t].o && stack[t].n > 0) { bottommost = false; break; }
+        }
+        const prelimU = cand.n >= 2 && closer.n >= 2 ? 2 : 1;
+        const allow = bottommost && (
+          (cand.n === 1 && !OBStrong[closer.ch]) ||
+          (prelimU === 2 && OBStrong[closer.ch]) ||
+          (closer.n > cand.n)
+        );
+        if (allow) {
+          // fall through and examine this candidate
+        } else break;
+      }
+      if (!cand.o || cand.n === 0) continue;
+      examined = true;
+      const candBoth = cand.o && cand.c;
       const closerBoth = closer.o && closer.c;
-      if ((openerBoth || closerBoth) && (opener.n + closer.n) % 3 === 0 && !(opener.n % 3 === 0 && closer.n % 3 === 0)) continue;
-      found = s; break;
+      if ((candBoth || closerBoth) && (cand.n + closer.n) % 3 === 0 && !(cand.n % 3 === 0 && closer.n % 3 === 0)) continue;
+      let u = cand.n >= 2 && closer.n >= 2 ? 2 : 1;
+      if (cand.n > 2) {
+        const oIdx = nodes.indexOf(cand);
+        const bothEm = countBothEm(nodes.slice(oIdx + 1, idx));
+        if (bothEm > 0) {
+          const effO = cand.n - 2 * bothEm;
+          if (effO > 2) continue; // this opener cannot match; try an earlier one
+          if (effO >= 1) u = Math.min(effO, closer.n);
+        }
+      }
+      // An `<em>` (use 1) spanning a `<strong>` whose closer could also
+      // open does not form when the em would sit inside a `<strong>` (a
+      // `**` opener of the same char waits below this opener in the
+      // stack): skip this opener and try an earlier one. Without that
+      // enclosing `**` opener the em does form (e.g. `*foo**bar**baz*`).
+      if (u === 1) {
+        const oIdx = nodes.indexOf(cand);
+        if (hasStrongOpenCloser(nodes.slice(oIdx + 1, idx))) {
+          let belowStrong = false;
+          for (let t = s - 1; t >= 0; t--) {
+            if (stack[t].ch === closer.ch && stack[t].o && stack[t].n >= 2) { belowStrong = true; break; }
+          }
+          if (belowStrong) continue;
+        }
+      }
+      found = s; use = u; break;
     }
     if (found === -1) {
-      if (closer.o && closer.n > 0) stack.push(closer);
+      // --- failure: update OB ---
+      if (examined) { OB[closer.ch] = null; OBStrong[closer.ch] = false; }
+      else if (closer.o) {
+        let prev = null;
+        for (let s = stack.indexOf(closer) - 1; s >= 0; s--) {
+          if (stack[s].ch === closer.ch) { prev = stack[s]; break; }
+        }
+        OB[closer.ch] = prev; OBStrong[closer.ch] = false;
+      } else { OB[closer.ch] = null; OBStrong[closer.ch] = false; }
+      // A leftover closer that failed to match becomes text inside the
+      // emphasis it came from when that emphasis was a strong whose opener
+      // was fully used and whose span held a plain `<em>`.
+      if (closer.leftOf && closer.leftOf.oc && closer.leftOf.strong && closer.leftOf.plainEm) {
+        const em = closer.leftOf.em;
+        em.kids.push({ t: 'x', s: closer.ch.repeat(closer.n) });
+        nodes.splice(idx, 1);
+        const si = stack.indexOf(closer);
+        if (si !== -1) stack.splice(si, 1);
+        continue; // do not advance idx: the next node shifted into place
+      }
+      if (!closer.o) {
+        const si = stack.indexOf(closer);
+        if (si !== -1) stack.splice(si, 1);
+      }
       idx++; continue;
     }
+    // --- match ---
     const opener = stack[found];
-    const use = opener.n >= 2 && closer.n >= 2 ? 2 : 1;
+    let belowOpener = null;
+    for (let s = found - 1; s >= 0; s--) {
+      if (stack[s].ch === closer.ch) { belowOpener = stack[s]; break; }
+    }
     const oIdx = nodes.indexOf(opener);
     const kids = nodes.slice(oIdx + 1, idx);
-    // Delimiters inside the new emphasis can no longer match outside it.
+    const useO = Math.min(use, opener.n);
+    const useC = Math.min(use, closer.n);
     for (const k of kids) {
       if (k.t === 'd') {
         const si = stack.indexOf(k);
         if (si !== -1) stack.splice(si, 1);
       }
     }
-    opener.n -= use;
-    closer.n -= use;
-    const em = { t: 'e', strong: use === 2, del: closer.ch === '~', kids };
-    const rebuilt = nodes.slice(0, oIdx);
-    if (opener.n > 0) rebuilt.push(opener);
-    else stack.splice(found, 1);
-    rebuilt.push(em);
-    if (closer.n > 0) rebuilt.push({ t: 'd', ch: closer.ch, n: closer.n, o: closer.o, c: true });
-    for (let k = idx + 1; k < nodes.length; k++) rebuilt.push(nodes[k]);
-    nodes.length = 0;
-    for (const x of rebuilt) nodes.push(x);
-    idx = rebuilt.indexOf(em) + 1;
+    const openerLeft = opener.n - useO;
+    const plainEm = hasPlainEm(kids);
+    const openerInside = openerLeft > 0 && plainEm;
+    const emKids = kids.slice();
+    if (openerInside) emKids.unshift({ t: 'x', s: opener.ch.repeat(openerLeft) });
+    const openerConsumed = openerLeft === 0;
+    const em = { t: 'e', strong: useO === 2, del: closer.ch === '~', kids: emKids, bo: opener.o && opener.c, oc: openerConsumed, bc: closer.o && closer.c };
+    const closerLeft = closer.n - useC;
+    // Keep a leftover opener in place (before the em) so a later closer can
+    // still find it; otherwise replace the whole span with the em.
+    let emIdx;
+    if (openerLeft > 0 && !openerInside) {
+      opener.n = openerLeft;
+      nodes.splice(oIdx + 1, idx - oIdx, em);
+      emIdx = oIdx + 1;
+    } else {
+      nodes.splice(oIdx, idx - oIdx + 1, em);
+      emIdx = oIdx;
+      const si = stack.indexOf(opener);
+      if (si !== -1) stack.splice(si, 1);
+    }
+    if (closerLeft > 0) {
+      const leftNode = { t: 'd', ch: closer.ch, n: closerLeft, o: closer.o, c: closer.c, leftOf: { em, oc: openerConsumed, strong: useO === 2, plainEm } };
+      nodes.splice(emIdx + 1, 0, leftNode);
+      const ci = stack.indexOf(closer);
+      if (ci !== -1) stack[ci] = leftNode;
+      else stack.push(leftNode);
+    } else {
+      const ci = stack.indexOf(closer);
+      if (ci !== -1) stack.splice(ci, 1);
+    }
+    // OB is set to the delimiter below the opener only when the closer can
+    // open and the opener cannot close; a fully consumed closer that cannot
+    // open clears it; otherwise it is left alone. Record whether the match
+    // that set it was a `<strong>`, for the OB exception in the search.
+    if (closer.o && !opener.c) { OB[closer.ch] = belowOpener; OBStrong[closer.ch] = useO === 2; }
+    else if (!closer.o && closerLeft === 0) { OB[closer.ch] = null; OBStrong[closer.ch] = false; }
+    idx = emIdx + 1;
   }
   // Any delimiter node left over renders as literal text.
   for (let k = 0; k < nodes.length; k++) {
@@ -1335,7 +1620,10 @@ function parseBlocks(lines, start, end, refs, top, eol, inList) {
             if (m === l.length) { closed = true; break; }
           }
         }
-        content.push(fenceIndent > 0 ? stripIndent(l, fenceIndent) : l);
+        // A backtick fence strips up to its own indent from content
+        // lines; a tilde fence keeps content lines verbatim (marked
+        // does not strip the indent for ~~~ fences).
+        content.push(ch === '`' && fenceIndent > 0 ? stripIndent(l, fenceIndent) : l);
         j++;
       }
       // A closed fence drops one trailing empty line from its content.
@@ -1362,13 +1650,16 @@ function parseBlocks(lines, start, end, refs, top, eol, inList) {
       } else {
         while (j < end && !isBlank(lines[j])) { content.push(lines[j]); j++; }
       }
-      // The block's text is its lines joined by newlines. A trailing newline
-      // is kept when the next line in this scope is non-empty (even a
-      // whitespace-only line, e.g. a lone tab, counts: it is not an empty
-      // line), or when the block runs to the end of the top-level input
-      // that ends with one.
+      // The block's text is its lines joined by newlines. A trailing
+      // newline is kept when the block runs to the end of the top-level
+      // input that ends with one. Type 1-5 blocks end at an end marker,
+      // so a trailing newline is also kept when a next line exists and
+      // is non-empty (even a whitespace-only line, e.g. a lone tab,
+      // counts: it is not an empty line). Type 6-7 blocks end at a
+      // blank line, which already separates them, so no trailing
+      // newline is added for them.
       let text = content.join('\n');
-      const nextNonEmpty = j < end && lines[j].length > 0;
+      const nextNonEmpty = type <= 5 && j < end && lines[j].length > 0;
       if (nextNonEmpty || (j >= end && top && eol)) text += '\n';
       blocks.push({ t: 'html', text });
       i = j;
@@ -1572,9 +1863,12 @@ function parseBlockquote(lines, i, end, refs, blocks) {
       // Lazy continuation line. It is paragraph text, so it is joined to
       // the previous inner line (never re-parsed as a block: a lazy
       // "- bar" is text, not a list item). Its leading whitespace is
-      // stripped. A setext-looking lazy line is kept as its own line,
-      // indented by four spaces so it stays paragraph text.
-      const stripped = l.replace(/^[ \t]+/, '');
+      // kept, except that a run of 4+ columns loses its first 4 columns
+      // (the indented-code indent); a tab in the run is consumed whole
+      // when it lands on that boundary. A setext-looking lazy line is
+      // kept as its own line, indented by four spaces so it stays
+      // paragraph text.
+      const stripped = stripLazyIndent(l);
       if (matchSetext(stripped)) qlines.push('    ' + stripped);
       else qlines[qlines.length - 1] += '\n' + stripped;
       j++;
@@ -1668,7 +1962,11 @@ function parseList(lines, i, end, refs, blocks) {
     const lastLine = inner.length ? inner[inner.length - 1] : null;
     const inPara = lastLine !== null && isParaLine(lastLine, j + 1 < end ? lines[j + 1] : undefined) && !endsInFence(inner);
     if (inPara && !interruptsParagraph(line, j + 1 < end ? lines[j + 1] : undefined, true)) {
-      const stripped = line.replace(/^[ \t]+/, '');
+      // Lazy continuation of the item's paragraph: its leading
+      // whitespace is kept, except that a run of 4+ columns loses its
+      // first 4 columns (the indented-code indent); a tab in the run
+      // is consumed whole when it lands on that boundary.
+      const stripped = stripLazyIndent(line);
       if (matchSetext(stripped)) inner.push('    ' + stripped);
       else inner[inner.length - 1] += '\n' + stripped;
       j++;
