@@ -996,15 +996,15 @@ let parseInlineDepth = 0;
 let inLink = false;
 
 // Update inLink for a raw HTML tag `tag` (the full tag text). Any opening
-// <a> tag sets it, even a self-closing <a/> (in HTML that slash is ignored
-// for non-void elements, so it still opens the anchor); only </a> clears it.
+// <a> tag sets it, except a self-closing <a/> (marked treats the slash as
+// closing it for this purpose); only </a> clears it.
 function trackLinkTag(tag) {
   const lower = tag.toLowerCase();
   if (lower.startsWith('</a') && (lower[3] === ' ' || lower[3] === '\t' || lower[3] === '\n' || lower[3] === '>')) {
     inLink = false;
     return;
   }
-  if (lower.startsWith('<a') && (lower[2] === ' ' || lower[2] === '\t' || lower[2] === '\n' || lower[2] === '>' || lower[2] === '/')) {
+  if (lower.startsWith('<a') && (lower[2] === ' ' || lower[2] === '\t' || lower[2] === '\n' || lower[2] === '>')) {
     inLink = true;
   }
 }
